@@ -1,0 +1,52 @@
+### Build output ###
+target/
+build/
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### Eclipse / STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Local tool settings ###
+.claude/settings.local.json
+
+### OS ###
+.DS_Store
+Thumbs.db
+
+### Runtime output ###
+*.log
+logs/
+test-results*.json
+rag-test-results*.csv
+
+### Local notes ###
+LEARNING.md
+TESTING_GUIDE.md
+CHAT_API_WALKTHROUGH.md
+
+### Source documents ###
+# Policy PDFs are input data rather than source. The generated sample is tracked so
+# the project can be run straight after cloning.
+Hr Policy/*.pdf
+!Hr Policy/sample-hr-policy.pdf

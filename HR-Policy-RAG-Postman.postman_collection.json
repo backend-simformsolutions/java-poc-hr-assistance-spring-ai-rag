@@ -1,0 +1,421 @@
+{
+  "info": {
+    "_postman_id": "hr-policy-rag-collection",
+    "name": "HR Policy RAG Assistant",
+    "description": "Complete API collection for the Spring Boot HR Policy RAG backend.\n\nAll 9 endpoints are generated from the actual controllers:\n- ChatController      -> POST /api/chat\n- DocumentController  -> POST /api/documents/upload, DELETE /api/documents/all\n- DebugController     -> GET /api/debug/search, /api/debug/search-raw, /api/debug/stats\n- Actuator            -> GET /actuator/health, /actuator/info, /actuator/metrics\n\n## Before you run\n1. Ollama must be listening on 11434 with `llama3` and `nomic-embed-text` pulled.\n2. Postgres+pgvector must be up: `docker-compose up -d` (host port 5433).\n3. Start the app: `mvn spring-boot:run`\n\n## Suggested order\nRun folder 0 (health) -> folder 1 (upload) -> folder 2 (verify retrieval) -> folder 3 (full RAG).\nIf documents are already ingested you can skip folder 1 entirely.\n\n## Note on timing\nRequests in folder 3 take 5-30s. The first call is slowest because Ollama must load llama3 (4.7 GB) into memory.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string",
+      "description": "App base URL. Change here once instead of editing every request."
+    },
+    {
+      "key": "pdfPath",
+      "value": "Hr Policy/sample-hr-policy.pdf",
+      "type": "string",
+      "description": "Path to the PDF used by the upload request, relative to the repository root. Defaults to the tracked synthetic sample. Postman may require you to re-select the file manually via the Body tab."
+    },
+    {
+      "key": "sampleQuestion",
+      "value": "How many casual leaves do I get per year?",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Health & Info",
+      "description": "Actuator endpoints. Exposure is controlled by `management.endpoints.web.exposure.include: health,info,metrics` in application.yml — no other actuator endpoint is reachable over HTTP.",
+      "item": [
+        {
+          "name": "0.1 Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "health"]
+            },
+            "description": "Verifies the app is up.\n\nBecause `management.endpoint.health.show-details: always` is set, the response includes per-component detail — notably the `db` component. If `db` reports DOWN, the pgvector container on port 5433 is not reachable and every RAG call will fail.\n\nExpected: 200 with {\"status\":\"UP\", \"components\": {...}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('app is UP', () => pm.expect(pm.response.json().status).to.eql('UP'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "0.2 Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/info",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "info"]
+            },
+            "description": "Build/app info. Returns an empty object {} unless you add `info.*` properties to application.yml or enable the build-info Maven goal — an empty body here is normal, not an error."
+          }
+        },
+        {
+          "name": "0.3 Metrics (list)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "metrics"]
+            },
+            "description": "Lists available metric names. Drill into one by appending it, e.g. /actuator/metrics/http.server.requests or /actuator/metrics/hikaricp.connections.active (useful for spotting connection-pool exhaustion during bulk ingestion)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. Document Ingestion",
+      "description": "Upload PDFs and clear the vector store. This is the 'write' side of the RAG pipeline: PDF -> text (PDFBox) -> chunks -> embeddings (nomic-embed-text) -> pgvector.",
+      "item": [
+        {
+          "name": "1.1 Upload PDF",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "{{pdfPath}}",
+                  "description": "The form-field name MUST be exactly 'file' — it is bound by @RequestParam(\"file\") MultipartFile in DocumentController. Any other name returns 400."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/documents/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "documents", "upload"]
+            },
+            "description": "POST /api/documents/upload  (consumes multipart/form-data)\n\nDo NOT set Content-Type manually — Postman generates the multipart boundary for you. Adding the header by hand breaks the request.\n\nPipeline triggered by this call:\n1. PdfTextExtractor  — PDFBox Loader.loadPDF + PDFTextStripper\n2. TextChunkingService — chunk-size 1000 chars, overlap 50\n3. EmbeddingModel — one 768-dim vector per chunk via Ollama /api/embed\n4. VectorStore.add — INSERT into vector_store\n\nResponse (UploadResponse): fileName, totalCharacters, totalChunks, message, plus timing.\n\nCAVEAT — there is no dedup on documentName. Uploading the same PDF twice stores two full copies of every chunk, and both copies then compete in retrieval. Run 1.2 first if you are re-ingesting.\n\nScanned/image-only PDFs extract to empty text (no OCR in this project) and will fail rather than silently store nothing."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('chunks were created', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.totalChunks, 'totalChunks').to.be.above(0);",
+                  "    pm.expect(b.totalCharacters, 'totalCharacters').to.be.above(0);",
+                  "});",
+                  "console.log('Ingested:', pm.response.json().fileName, '->', pm.response.json().totalChunks, 'chunks');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.2 Delete ALL Documents",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/documents/all",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "documents", "all"]
+            },
+            "description": "DELETE /api/documents/all\n\nDESTRUCTIVE — deletes every row in vector_store via chunkRepository.deleteAllChunks(). There is no per-document delete and no confirmation step. After this you must re-upload every PDF and re-embed, which costs a fresh embedding call per chunk.\n\nUse it when: you changed chunk-size/overlap, switched embedding models, or accidentally double-ingested.\n\nResponse: {\"deletedChunks\": N, ...}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Retrieval Debug (no LLM)",
+      "description": "Inspect the RETRIEVAL half of RAG without paying for a slow LLM call. When an answer looks wrong, always check here first — it tells you whether the problem is retrieval (wrong/no chunks) or generation (right chunks, bad answer).",
+      "item": [
+        {
+          "name": "2.1 Stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/debug/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "debug", "stats"]
+            },
+            "description": "GET /api/debug/stats\n\nReturns what is stored plus the settings in force:\n- totalChunks, documentCount, documents[]\n- defaultTopK, similarityThreshold   (confirms a config change took effect)\n- citationMode                       (which citation strategy is active)\n- promptTemplate                     (the template belonging to that mode)\n\nThe cheapest way to answer 'is anything actually ingested?' — run this before debugging a bad answer."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log('Chunks in store:', JSON.stringify(b));",
+                  "pm.test('store is not empty', () => pm.expect(JSON.stringify(b)).to.not.include('\"totalChunks\":0'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.2 Search (similarity, threshold applied)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/debug/search?q=casual leave&topK=5",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "debug", "search"],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "casual leave",
+                  "description": "REQUIRED. Bound by @RequestParam(\"q\") — the param name is 'q', not 'query'. Omitting it returns 400."
+                },
+                {
+                  "key": "topK",
+                  "value": "5",
+                  "description": "Optional. Omitted, the configured app.retrieval.default-top-k applies (5 by default); GET /api/debug/stats reports the value in force."
+                }
+              ]
+            },
+            "description": "GET /api/debug/search?q=...&topK=...\n\nEmbeds your query, runs a cosine-similarity search against pgvector, and returns DebugSearchResponse:\n- query\n- embeddingDimensions      (must be 768 — mismatch means wrong embedding model)\n- retrievedChunks[]         (text + score + document + chunkIndex + metadata)\n- generatedPrompt           (the prompt the active citationMode produces)\n- citationMode              (which template generatedPrompt was built from)\n- structuredOutputSchema    (appended by Spring AI at call time; null unless model-attributed)\n- searchParams              (the topK and similarityThreshold actually applied)\n\n`generatedPrompt` is the most valuable field: it is the same text POST /api/chat sends, so it shows how the rules and retrieved context are assembled and roughly how much context you are spending. In model-attributed mode it carries [S1]/[S2] source labels.\n\nPage numbers are inside each chunk's `metadata`, not on the chunk itself.\n\nOmit topK to use the configured default. Invalid input returns 400: blank q, topK outside 1-20, or a non-numeric topK.\n\nIf retrievedChunks is empty, the threshold filtered everything out — compare with 2.3."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('embedding is 768-dim (matches pgvector column)', () => {",
+                  "    pm.expect(b.embeddingDimensions).to.eql(768);",
+                  "});",
+                  "pm.test('at least one chunk retrieved', () => {",
+                  "    pm.expect(b.retrievedChunks).to.be.an('array').that.is.not.empty;",
+                  "});",
+                  "if (b.retrievedChunks && b.retrievedChunks.length) {",
+                  "    console.log('Top score:', b.retrievedChunks[0].similarityScore, 'from', b.retrievedChunks[0].documentName);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.3 Search RAW (tune the threshold)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/debug/search-raw?q=casual leave&topK=5&threshold=0.3",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "debug", "search-raw"],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "casual leave",
+                  "description": "REQUIRED. @RequestParam(\"q\")."
+                },
+                {
+                  "key": "topK",
+                  "value": "5",
+                  "description": "Optional. Omitted, the configured app.retrieval.default-top-k applies (5 by default)."
+                },
+                {
+                  "key": "threshold",
+                  "value": "0.3",
+                  "description": "Optional. Pre-filled at 0.3 here to demonstrate a stricter sweep; omit it and the configured app.retrieval.similarity-threshold applies (0.1), the same value 2.2 uses."
+                }
+              ]
+            },
+            "description": "GET /api/debug/search-raw?q=...&topK=...&threshold=...\n\nSame search as 2.2, but executed as hand-written SQL against pgvector rather than through VectorStore, and the similarity threshold is a request parameter you can sweep without restarting the app. This is the tool for calibrating `app.retrieval.similarity-threshold`.\n\nTry threshold=0.0 (everything), 0.3, then 0.7 (very strict) on the same query and watch how many chunks survive. Too low admits irrelevant chunks that waste context window; too high starves the LLM and produces 'I could not find this information'.\n\nAlso returns sqlExecuted — the real statement, placeholders intact — with sqlParameters explaining each binding.\n\nOmit threshold and topK and it applies the same configured defaults as 2.2, so the two are directly comparable: identical rankings are expected, and a difference points at the abstraction rather than the data. Validation matches 2.2, plus threshold must be 0.0-1.0."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "console.log('Raw search result:', pm.response.text().substring(0, 400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Full RAG Chat",
+      "description": "The complete retrieve -> augment -> generate pipeline. Slow by design (5-30s): step 3 blocks on llama3 inference inside Ollama.",
+      "item": [
+        {
+          "name": "3.1 Ask Question (default topK)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": { "raw": { "language": "json" } },
+              "raw": "{\n  \"question\": \"{{sampleQuestion}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "chat"]
+            },
+            "description": "POST /api/chat\n\nBody: ChatRequest { question (required, @NotBlank), topK (optional, @Min 1 / @Max 20) }\n\nOmitting topK returns null from ChatRequest.requestedTopK(), and RetrievalService then applies app.retrieval.default-top-k — 5 in application.yml. That keeps the default in one place; check GET /api/debug/stats to see the value in force.\n\nResponse (ChatResponse): answer, sources (document plus page numbers), retrievedChunks with similarity scores, chunk count, processingTimeMs.\n\nIf the answer is 'I could not find this information in the HR policies provided' even though 2.2 returned good chunks, the prompt may be exceeding the context window: num-ctx is set to 8192 under spring.ai.ollama.chat.options, and a prompt that together with num-predict exceeds it is truncated from the front, where the role and grounding rules sit, before the retrieved context that follows them. Lower topK or raise num-ctx."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('answer is present', () => pm.expect(b.answer).to.be.a('string').and.not.empty);",
+                  "pm.test('answer is grounded (sources returned)', () => {",
+                  "    pm.expect(JSON.stringify(b)).to.match(/chunk|source/i);",
+                  "});",
+                  "console.log('Took', b.processingTimeMs, 'ms');",
+                  "console.log('ANSWER:', b.answer);",
+                  "if (b.answer && /could not find/i.test(b.answer)) {",
+                  "    console.warn('Fallback answer returned — check /api/debug/search first, then num-ctx.');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.2 Ask Question (explicit topK)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": { "raw": { "language": "json" } },
+              "raw": "{\n  \"question\": \"What is the work from home policy?\",\n  \"topK\": 5\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "chat"]
+            },
+            "description": "Same endpoint with topK pinned explicitly.\n\nRaise it (try 15) and run back-to-back against 3.1, which uses the configured default of 5: more chunks means a longer prompt, slower inference, and more risk of blowing the context window — but a lower chance the answer-bearing chunk was never retrieved. This trade-off is the core tuning knob of RAG."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "console.log('ANSWER:', pm.response.json().answer);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.3 Validation Error — topK out of range (expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": { "raw": { "language": "json" } },
+              "raw": "{\n  \"question\": \"How many leaves do I get?\",\n  \"topK\": 25\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "chat"]
+            },
+            "description": "NEGATIVE TEST — topK=25 violates @Max(20) on ChatRequest.\n\nFlow: @Valid triggers Hibernate Validator -> MethodArgumentNotValidException -> GlobalExceptionHandler -> 400 with the message 'topK must be at most 20'. No LLM call is made, so this returns instantly.\n\nExpected: 400, NOT 200."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "console.log('Error body:', pm.response.text());"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.4 Validation Error — blank question (expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": { "raw": { "language": "json" } },
+              "raw": "{\n  \"question\": \"   \"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "chat"]
+            },
+            "description": "NEGATIVE TEST — @NotBlank rejects null, empty, and whitespace-only strings. A body of {\"question\": \"   \"} is therefore invalid even though the field is present.\n\nExpected: 400 with 'Question must not be blank'."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "console.log('Error body:', pm.response.text());"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
