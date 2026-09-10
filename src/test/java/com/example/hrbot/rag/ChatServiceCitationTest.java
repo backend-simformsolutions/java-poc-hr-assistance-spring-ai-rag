@@ -65,6 +65,7 @@ class ChatServiceCitationTest {
 
         when(retrievalService.retrieveDocuments(anyString(), any())).thenReturn(DOCUMENTS);
         when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(responseSpec);
     }
@@ -192,16 +193,65 @@ class ChatServiceCitationTest {
                     "OverTime Policy.pdf (page 1)");
         }
 
-        /** A refusal legitimately cites nothing. */
+        /**
+         * A refusal states that the retrieved text does not answer the question, so it
+         * must carry no citations. Citing the pages searched would present the refusal as
+         * though it had been drawn from them.
+         */
         @Test
-        void handlesEmptyCitationList() {
-            modelReturns(new CitedAnswer(
-                    "I could not find this information in the HR policies provided.", List.of()));
+        void aRefusalCitesNothing() {
+            modelReturns(new CitedAnswer(PromptBuilder.REFUSAL_SENTENCE, List.of()));
 
             ChatResponse response = ask(ChatService.MODE_MODEL_ATTRIBUTED);
 
-            assertThat(response.answer()).startsWith("I could not find this information");
-            assertThat(response.sources()).isNotEmpty();   // degrades to retrieved pages
+            assertThat(response.answer()).isEqualTo(PromptBuilder.REFUSAL_SENTENCE);
+            assertThat(response.sources()).isEmpty();
+        }
+
+        /** A refusal cites nothing even if the model also reports labels. */
+        @Test
+        void aRefusalCitesNothingEvenWhenLabelsAreReported() {
+            modelReturns(new CitedAnswer(PromptBuilder.REFUSAL_SENTENCE, List.of("S1", "S2")));
+
+            assertThat(ask(ChatService.MODE_MODEL_ATTRIBUTED).sources()).isEmpty();
+        }
+
+        /** A model that reflows the sentence across lines is still refusing. */
+        @Test
+        void aRefusalIsRecognisedDespiteReflowedWhitespace() {
+            modelReturns(new CitedAnswer(
+                    "I could not find this information in the HR policies\nprovided.   Please"
+                            + " contact the HR department directly.",
+                    List.of()));
+
+            assertThat(ask(ChatService.MODE_MODEL_ATTRIBUTED).sources()).isEmpty();
+        }
+
+        /** A model that drops the closing clause is still refusing. */
+        @Test
+        void aRefusalIsRecognisedWithoutItsClosingClause() {
+            modelReturns(new CitedAnswer(
+                    "I could not find this information in the HR policies provided.",
+                    List.of()));
+
+            assertThat(ask(ChatService.MODE_MODEL_ATTRIBUTED).sources()).isEmpty();
+        }
+
+        /**
+         * A multi-part question can be half answered: the model resolves what it found and
+         * appends the refusal for the rest. That answer carries real policy facts, so it
+         * must keep its citations — matching the refusal by containment would strip them.
+         */
+        @Test
+        void anAnswerThatMerelyEndsInARefusalKeepsItsCitations() {
+            modelReturns(new CitedAnswer(
+                    "You get 13 planned leaves each calendar year. "
+                            + PromptBuilder.REFUSAL_SENTENCE,
+                    List.of("S1")));
+
+            ChatResponse response = ask(ChatService.MODE_MODEL_ATTRIBUTED);
+
+            assertThat(response.sources()).containsExactly("Leave Policy.pdf (page 1)");
         }
 
         @Test
@@ -252,6 +302,17 @@ class ChatServiceCitationTest {
                     "OverTime Policy.pdf (page 1)");
         }
 
+        /** This mode cites everything retrieved — except when the answer is a refusal. */
+        @Test
+        void aRefusalCitesNothing() {
+            when(responseSpec.content()).thenReturn(PromptBuilder.REFUSAL_SENTENCE);
+
+            ChatResponse response = ask(ChatService.MODE_RETRIEVAL_SCOPED);
+
+            assertThat(response.answer()).isEqualTo(PromptBuilder.REFUSAL_SENTENCE);
+            assertThat(response.sources()).isEmpty();
+        }
+
         @Test
         void reportsRetrievedChunkCountAndMetadata() {
             when(responseSpec.content()).thenReturn("Answer text.");
@@ -276,11 +337,12 @@ class ChatServiceCitationTest {
 
         @Test
         void appearInTheCitedPrompt() {
-            String prompt = new PromptBuilder().buildCitedPrompt(DOCUMENTS, "How many leaves?");
+            PromptBuilder.GroundedPrompt prompt =
+                    new PromptBuilder().buildCitedPrompt(DOCUMENTS, "How many leaves?");
 
-            assertThat(prompt).contains("[S1] from Leave Policy.pdf");
-            assertThat(prompt).contains("[S3] from OverTime Policy.pdf");
-            assertThat(prompt).contains("Do NOT invent labels");
+            assertThat(prompt.user()).contains("[S1] from Leave Policy.pdf");
+            assertThat(prompt.user()).contains("[S3] from OverTime Policy.pdf");
+            assertThat(prompt.system()).contains("Do NOT invent labels");
         }
     }
 }

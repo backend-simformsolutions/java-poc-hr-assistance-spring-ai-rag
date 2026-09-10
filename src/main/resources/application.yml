@@ -48,8 +48,8 @@ spring:
           # the model's maximum.
           #
           # A prompt that together with num-predict exceeds this budget is truncated
-          # from the front, where the role and grounding rules sit, before the retrieved
-          # context that follows them.
+          # rather than rejected, and what survives is not guaranteed. Keep default-top-k
+          # low enough that the retrieved context and the question fit comfortably.
           #
           # 8192 is llama3's maximum. Larger windows cost KV-cache memory and slow
           # prompt evaluation.

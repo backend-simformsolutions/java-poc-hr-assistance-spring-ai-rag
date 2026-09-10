@@ -43,7 +43,6 @@ rag-test-results*.csv
 ### Local notes ###
 LEARNING.md
 TESTING_GUIDE.md
-CHAT_API_WALKTHROUGH.md
 
 ### Source documents ###
 # Policy PDFs are input data rather than source. The generated sample is tracked so

@@ -5,6 +5,7 @@ import com.example.hrbot.dto.ChatResponse;
 import com.example.hrbot.dto.CitedAnswer;
 import com.example.hrbot.dto.RetrievedChunk;
 import com.example.hrbot.prompts.PromptBuilder;
+import com.example.hrbot.prompts.PromptBuilder.GroundedPrompt;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.converter.BeanOutputConverter;
@@ -136,26 +137,35 @@ public class ChatService {
     private record GeneratedAnswer(String answer, List<String> sources) {}
 
     /**
-     * The prompt {@link #chat} would send for these documents and this question.
+     * The prompt {@link #chat} would send for these documents and this question, both
+     * messages of it.
      *
      * <p>Exposed so that diagnostic callers render the prompt belonging to the
      * configured mode without selecting a template themselves.
      *
      * <p>Under {@link #MODE_MODEL_ATTRIBUTED} the structured-output converter appends a
-     * schema instruction to this text when the call is made; that suffix is reported
-     * separately by {@link #structuredOutputSchema()} rather than spliced in here.
+     * schema instruction to the user message when the call is made; that suffix is
+     * reported separately by {@link #structuredOutputSchema()} rather than spliced in
+     * here.
      */
-    public String promptFor(List<Document> documents, String question) {
+    public GroundedPrompt promptFor(List<Document> documents, String question) {
         return modelAttributed()
                 ? promptBuilder.buildCitedPrompt(documents, question)
                 : promptBuilder.buildPrompt(documents, question);
     }
 
-    /** The template backing the active citation mode, without context. */
-    public String activePromptTemplate() {
+    /** The system message backing the active citation mode. */
+    public String activeSystemPrompt() {
         return modelAttributed()
-                ? promptBuilder.getCitedTemplatePreview()
-                : promptBuilder.getTemplatePreview();
+                ? promptBuilder.getCitedSystemPrompt()
+                : promptBuilder.getSystemPrompt();
+    }
+
+    /** The user template backing the active citation mode, without context. */
+    public String activeUserTemplate() {
+        return modelAttributed()
+                ? promptBuilder.getCitedUserTemplate()
+                : promptBuilder.getUserTemplate();
     }
 
     /** The configured citation mode. */
@@ -190,13 +200,14 @@ public class ChatService {
                                                     String question,
                                                     List<RetrievedChunk> chunks) {
         log.info("Step 2: Building labelled prompt for model-attributed citations");
-        String prompt = promptBuilder.buildCitedPrompt(documents, question);
+        GroundedPrompt prompt = promptBuilder.buildCitedPrompt(documents, question);
 
         log.info("Step 3: Generating structured answer");
         CitedAnswer cited;
         try {
             cited = chatClient.prompt()
-                    .user(prompt)
+                    .system(prompt.system())
+                    .user(prompt.user())
                     .call()
                     .entity(CitedAnswer.class);
         } catch (RuntimeException e) {
@@ -210,19 +221,60 @@ public class ChatService {
             return generatePlain(documents, question, chunks);
         }
 
+        String answer = cited.answer().trim();
+
+        // A refusal states that the retrieved text does not answer the question, so
+        // there is nothing to attribute. Citing the pages searched would present the
+        // refusal as though it had been drawn from them.
+        if (isRefusal(answer)) {
+            log.info("Step 3 complete: refusal, cited nothing");
+            return new GeneratedAnswer(answer, List.of());
+        }
+
         List<RetrievedChunk> attributed = resolveCitedChunks(cited.citations(), chunks);
 
         if (attributed.isEmpty()) {
-            // Refusals cite nothing by design. Also reached when no reported label
-            // resolves, where citing the pages searched remains accurate.
+            // No reported label resolved. The answer stands, and citing every page that
+            // was searched is less precise but still accurate.
             log.info("Step 3 complete: {} character answer, no verified citations",
-                    cited.answer().length());
-            return new GeneratedAnswer(cited.answer().trim(), buildCitations(chunks));
+                    answer.length());
+            return new GeneratedAnswer(answer, buildCitations(chunks));
         }
 
         log.info("Step 3 complete: {} character answer, {} of {} sources cited",
-                cited.answer().length(), attributed.size(), chunks.size());
-        return new GeneratedAnswer(cited.answer().trim(), buildCitations(attributed));
+                answer.length(), attributed.size(), chunks.size());
+        return new GeneratedAnswer(answer, buildCitations(attributed));
+    }
+
+    /**
+     * The first sentence of the refusal, used as the marker that an answer is a refusal.
+     *
+     * <p>Anchoring on the opening sentence rather than the whole of
+     * {@link PromptBuilder#REFUSAL_SENTENCE} tolerates a model that drops or rewords the
+     * closing "contact HR" clause while still refusing.
+     */
+    private static final String REFUSAL_OPENING = PromptBuilder.REFUSAL_SENTENCE
+            .substring(0, PromptBuilder.REFUSAL_SENTENCE.indexOf('.') + 1);
+
+    /**
+     * Whether an answer declines to answer from the retrieved text.
+     *
+     * <p>Matched on the opening of the refusal rather than by containment. Containment
+     * would also match an answer that resolves part of a multi-part question and appends
+     * the refusal for the rest — that answer carries real policy facts and must keep its
+     * citations. Anchoring at the start distinguishes "this is a refusal" from "this ends
+     * in a refusal".
+     *
+     * <p>Whitespace is collapsed first, so a model that reflows the sentence across lines
+     * is still recognised.
+     */
+    private boolean isRefusal(String answer) {
+        return collapseWhitespace(answer).startsWith(REFUSAL_OPENING);
+    }
+
+    /** Reduces every run of whitespace to a single space, so wrapping cannot matter. */
+    private String collapseWhitespace(String text) {
+        return text.replaceAll("\\s+", " ").trim();
     }
 
     /**
@@ -274,16 +326,17 @@ public class ChatService {
         return label.replaceAll("[^A-Za-z0-9]", "").toUpperCase(Locale.ROOT);
     }
 
-    /** Generates a plain answer and cites every retrieved page. */
+    /** Generates a plain answer and cites every retrieved page, unless it is a refusal. */
     private GeneratedAnswer generatePlain(List<Document> documents,
                                           String question,
                                           List<RetrievedChunk> chunks) {
         log.info("Step 2: Building grounded prompt with context");
-        String prompt = promptBuilder.buildPrompt(documents, question);
+        GroundedPrompt prompt = promptBuilder.buildPrompt(documents, question);
 
         log.info("Step 3: Generating answer");
         String answer = chatClient.prompt()
-                .user(prompt)
+                .system(prompt.system())
+                .user(prompt.user())
                 .call()
                 .content();
 
@@ -296,8 +349,15 @@ public class ChatService {
                             + "fits within its context window.");
         }
 
-        log.info("Step 3 complete: {} character answer", answer.length());
-        return new GeneratedAnswer(answer.trim(), buildCitations(chunks));
+        String trimmed = answer.trim();
+
+        if (isRefusal(trimmed)) {
+            log.info("Step 3 complete: refusal, cited nothing");
+            return new GeneratedAnswer(trimmed, List.of());
+        }
+
+        log.info("Step 3 complete: {} character answer", trimmed.length());
+        return new GeneratedAnswer(trimmed, buildCitations(chunks));
     }
 
     /** Converts Spring AI documents into the response DTO, preserving retrieval order. */

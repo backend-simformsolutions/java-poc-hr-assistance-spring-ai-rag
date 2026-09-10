@@ -3,6 +3,7 @@ package com.example.hrbot.controller;
 import com.example.hrbot.dto.DebugSearchResponse;
 import com.example.hrbot.dto.RetrievedChunk;
 import com.example.hrbot.embeddings.EmbeddingService;
+import com.example.hrbot.prompts.PromptBuilder;
 import com.example.hrbot.rag.ChatService;
 import com.example.hrbot.rag.RetrievalService;
 import com.example.hrbot.repository.DocumentChunkRepository;
@@ -87,7 +88,7 @@ public class DebugController {
         log.info("Debug search: query='{}', topK={}", q, effectiveTopK);
 
         List<Document> documents = retrievalService.retrieveDocuments(q, effectiveTopK);
-        String generatedPrompt = chatService.promptFor(documents, q);
+        PromptBuilder.GroundedPrompt prompt = chatService.promptFor(documents, q);
         int dimensions = embeddingService.getDimensions();
 
         List<RetrievedChunk> chunks = documents.stream()
@@ -108,7 +109,8 @@ public class DebugController {
                 q,
                 dimensions,
                 chunks,
-                generatedPrompt,
+                prompt.system(),
+                prompt.user(),
                 chatService.citationMode(),
                 chatService.structuredOutputSchema(),
                 new DebugSearchResponse.SearchParams(
@@ -179,7 +181,7 @@ public class DebugController {
     }
 
     /**
-     * Reports what is stored, the retrieval settings in force, and the prompt template
+     * Reports what is stored, the retrieval settings in force, and both prompt messages
      * belonging to the active citation mode.
      */
     @GetMapping("/stats")
@@ -193,7 +195,8 @@ public class DebugController {
         stats.put("defaultTopK", retrievalService.defaultTopK());
         stats.put("similarityThreshold", retrievalService.similarityThreshold());
         stats.put("citationMode", chatService.citationMode());
-        stats.put("promptTemplate", chatService.activePromptTemplate());
+        stats.put("systemPrompt", chatService.activeSystemPrompt());
+        stats.put("userPromptTemplate", chatService.activeUserTemplate());
         return ResponseEntity.ok(stats);
     }
 
