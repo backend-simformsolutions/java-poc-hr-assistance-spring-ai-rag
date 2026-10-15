@@ -241,6 +241,59 @@ internal identifier renumbered from zero whenever a document is re-ingested, and
 `metadata.pageNumber`/`pageNumberEnd` are the page range the citation was derived from.
 Neither should be surfaced to end users.
 
+### Ask a Question (Streaming)
+Same request body as `/api/chat`, but the answer arrives token by token as
+[Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events).
+`-N` stops curl buffering the output:
+
+```bash
+curl -N -X POST http://localhost:8080/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question": "How many annual leave days do I get, and how many can I carry forward?"}'
+```
+
+**Response** (`Content-Type: text/event-stream`, every `data` is JSON):
+```
+event:retrieval
+data:{"requestId":"a1b2c3d4","question":"How many annual leave days ...","chunksRetrieved":5,"retrievedChunks":[...]}
+
+event:token
+data:{"text":"All full-time employees are entitled to"}
+
+event:token
+data:{"text":" 20 days of annual paid leave per calendar year."}
+
+event:done
+data:{"sources":["sample-hr-policy.pdf (page 1)"],"processingTimeMs":11850}
+```
+
+A stream is always `retrieval`, then `token` events, then exactly one of `done` or
+`error`. Missing that final event means the connection dropped.
+A `:keep-alive` comment is also written every second until the stream ends. SSE clients
+ignore comments; they let the server notice a disconnect during silent stretches, such
+as while sources are being decided.
+
+- **Sources come last.** The answer is generated and streamed first. Once it is complete,
+  under `model-attributed` a second, structured model call reports which of the
+  retrieved sources the answer was taken from; every reported source is verified against
+  those supplied, and the resulting pages are sent in `done`. Expect `done` a few seconds
+  after the last token. Under `retrieval-scoped` that call is skipped and every retrieved
+  page is cited.
+- **Fallbacks.** Nothing verified, or the attribution call fails → `sources` lists every
+  retrieved page. A refusal → `sources` is empty, and no attribution call is made.
+- **Errors.** Validation and retrieval failures happen before streaming starts and
+  return the usual JSON error with a 4xx/5xx status, whatever the `Accept` header. A
+  failure during generation, or a stream that runs past `app.streaming.timeout` (150s),
+  arrives as `event:error` with a `requestId` to quote; text already received is
+  incomplete.
+- **Disconnects.** If the client goes away mid-answer — during generation or during
+  attribution — the request to Ollama is closed and it stops work, so an abandoned answer
+  does not hold up the next question. This relies on `reactor-netty-http` being on the
+  classpath; the JDK HTTP client does not close the connection on cancel.
+- **Browsers.** `EventSource` supports only GET, so read this POST endpoint with
+  `fetch()` and `response.body.getReader()`. Behind nginx, disable response buffering
+  (`X-Accel-Buffering: no`) or the events arrive all at once.
+
 ### Inspect Retrieval Without Calling the Model
 ```bash
 curl "http://localhost:8080/api/debug/search?q=sick%20leave&topK=5"
@@ -265,7 +318,7 @@ every chunk.
 
 ### Postman
 
-`HR-Policy-RAG-Postman.postman_collection.json` covers all nine endpoints with
+`HR-Policy-RAG-Postman.postman_collection.json` covers all ten endpoints with
 per-request notes, negative tests and assertions. Import it and set the `pdfPath`
 variable to the PDF you want to ingest.
 
@@ -283,6 +336,9 @@ curl.exe -X POST http://localhost:8080/api/documents/upload -F "file=@C:\path\to
 
 # Ask a question
 Invoke-RestMethod -Uri "http://localhost:8080/api/chat" -Method Post -ContentType "application/json" -Body '{"question": "What is the leave policy?", "topK": 5}'
+
+# Ask a question, streamed (Invoke-RestMethod waits for the whole body, so use curl.exe)
+curl.exe -N -X POST http://localhost:8080/api/chat/stream -H "Content-Type: application/json" -d '{\"question\": \"What is the leave policy?\"}'
 
 # Debug search
 Invoke-RestMethod -Uri "http://localhost:8080/api/debug/search?q=leave%20policy&topK=5"
@@ -320,6 +376,8 @@ src/main/java/com/example/hrbot/
 ├── dto/
 │   ├── ChatRequest.java           # Chat API request
 │   ├── ChatResponse.java          # Chat API response
+│   ├── ChatStreamEvent.java       # Streaming chat API events
+│   ├── SourceAttribution.java     # Structured reply used to attribute a streamed answer
 │   ├── CitedAnswer.java           # Structured reply used for model-attributed citations
 │   ├── RetrievedChunk.java        # Single chunk with score and page metadata
 │   ├── UploadResponse.java        # Upload API response

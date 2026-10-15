@@ -2,6 +2,7 @@ package com.example.hrbot.rag;
 
 import com.example.hrbot.dto.ChatRequest;
 import com.example.hrbot.dto.ChatResponse;
+import com.example.hrbot.dto.ChatStreamEvent;
 import com.example.hrbot.dto.CitedAnswer;
 import com.example.hrbot.prompts.PromptBuilder;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,16 +11,24 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
+import reactor.core.publisher.Flux;
 
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -70,8 +79,10 @@ class ChatServiceCitationTest {
         when(requestSpec.call()).thenReturn(responseSpec);
     }
 
+    private static final Duration STREAM_TIMEOUT = Duration.ofSeconds(30);
+
     private ChatService service(String mode) {
-        return new ChatService(retrievalService, new PromptBuilder(), chatClient, mode);
+        return new ChatService(retrievalService, new PromptBuilder(), chatClient, mode, STREAM_TIMEOUT);
     }
 
     @Nested
@@ -322,6 +333,259 @@ class ChatServiceCitationTest {
             assertThat(response.chunksRetrieved()).isEqualTo(3);
             assertThat(response.retrievedChunks()).hasSize(3);
             assertThat(response.retrievedChunks().getFirst().pageNumber()).isEqualTo(1);
+        }
+    }
+
+    @Nested
+    @DisplayName("streaming")
+    class Streaming {
+
+        private ChatClient.StreamResponseSpec streamSpec;
+
+        /** What the model streams for the answer, then for the attribution call. */
+        private Flux<String> answer = Flux.empty();
+        private Flux<String> attribution = Flux.empty();
+
+        @BeforeEach
+        void setUpStream() {
+            streamSpec = mock(ChatClient.StreamResponseSpec.class);
+            when(requestSpec.stream()).thenReturn(streamSpec);
+        }
+
+        private void modelStreams(String... tokens) {
+            answer = Flux.just(tokens);
+        }
+
+        /** The attribution reply arrives in pieces, as a streamed JSON object. */
+        private void attributionReports(String... labels) {
+            String json = Arrays.stream(labels)
+                    .map(label -> "\"" + label + "\"")
+                    .collect(Collectors.joining(",", "{\"citations\": [", "]}"));
+            attribution = Flux.just(json.substring(0, 5), json.substring(5));
+        }
+
+        private List<ChatStreamEvent> streamAnswer(String mode, Duration timeout) {
+            when(streamSpec.content()).thenReturn(answer, attribution);
+            return new ChatService(retrievalService, new PromptBuilder(), chatClient, mode, timeout)
+                    .streamChat(new ChatRequest("How many planned leaves do I get?", null))
+                    .collectList()
+                    .block();
+        }
+
+        private List<ChatStreamEvent> streamAnswer() {
+            return streamAnswer(ChatService.MODE_MODEL_ATTRIBUTED, STREAM_TIMEOUT);
+        }
+
+        private ChatStreamEvent.Done done(List<ChatStreamEvent> events) {
+            assertThat(events.getLast()).isInstanceOf(ChatStreamEvent.Done.class);
+            return (ChatStreamEvent.Done) events.getLast();
+        }
+
+        @Test
+        void emitsRetrievalThenEachTokenInOrderThenDone() {
+            modelStreams("You get", " 13 planned", " leaves.");
+            attributionReports("S1");
+
+            List<ChatStreamEvent> events = streamAnswer();
+
+            assertThat(events).hasSize(5);
+            ChatStreamEvent.Retrieval retrieval = (ChatStreamEvent.Retrieval) events.getFirst();
+            assertThat(retrieval.chunksRetrieved()).isEqualTo(3);
+            assertThat(retrieval.retrievedChunks()).hasSize(3);
+            assertThat(retrieval.requestId()).isNotBlank();
+            // Leading spaces belong to the token and must survive.
+            assertThat(events.subList(1, 4)).containsExactly(
+                    new ChatStreamEvent.Token("You get"),
+                    new ChatStreamEvent.Token(" 13 planned"),
+                    new ChatStreamEvent.Token(" leaves."));
+            assertThat(events.getLast()).isInstanceOf(ChatStreamEvent.Done.class);
+        }
+
+        /**
+         * The answer comes from the plain prompt, so it carries no labels; the labelled
+         * sources, the finished answer and the reply schema go to the attribution call.
+         */
+        @Test
+        void answersFromThePlainPromptThenAttributesTheCompletedAnswer() {
+            modelStreams("You get 13 planned", " leaves each calendar year.");
+            attributionReports("S1");
+
+            streamAnswer();
+
+            PromptBuilder prompts = new PromptBuilder();
+            verify(requestSpec).system(prompts.getSystemPrompt());
+            verify(requestSpec).system(prompts.getAttributionSystemPrompt());
+            verify(requestSpec).user(argThat((String user) ->
+                    user.contains("[S1] from Leave Policy.pdf")
+                            && user.contains("You get 13 planned leaves each calendar year.")
+                            && user.contains("\"citations\"")));
+            // Both calls stream, so a disconnect can cancel either; neither blocks.
+            verify(requestSpec, times(2)).stream();
+            verify(requestSpec, never()).call();
+        }
+
+        @Test
+        void citesOnlyThePagesTheAttributionNames() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+            attributionReports("S1");
+
+            assertThat(done(streamAnswer()).sources())
+                    .containsExactly("Leave Policy.pdf (page 1)");
+        }
+
+        @Test
+        void groupsSeveralAttributedSourcesByDocument() {
+            modelStreams("Leave and overtime detail.");
+            attributionReports("S3", "S1", "S2");
+
+            assertThat(done(streamAnswer()).sources()).containsExactly(
+                    "OverTime Policy.pdf (page 1)",
+                    "Leave Policy.pdf (pages 1, 2, 3)");
+        }
+
+        /** The same label validation as the blocking endpoint: invented labels are dropped. */
+        @Test
+        void ignoresInventedLabels() {
+            modelStreams("You get 13 planned leaves.");
+            attributionReports("S1", "S9", "[s1]");
+
+            assertThat(done(streamAnswer()).sources())
+                    .containsExactly("Leave Policy.pdf (page 1)");
+        }
+
+        /** Same safety net as the model-attributed mode: less precise, never false. */
+        @Test
+        void fallsBackToAllRetrievedPagesWhenNoLabelIsVerified() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+            attributionReports("S7");
+
+            assertThat(done(streamAnswer()).sources()).containsExactly(
+                    "Leave Policy.pdf (pages 1, 2, 3)",
+                    "OverTime Policy.pdf (page 1)");
+        }
+
+        /**
+         * The answer has already reached the client when attribution runs, so a failure
+         * there must not turn the stream into an error.
+         */
+        @Test
+        void fallsBackToAllRetrievedPagesWhenAttributionFails() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+            attribution = Flux.error(new IllegalStateException("connection to Ollama reset"));
+
+            assertThat(done(streamAnswer()).sources()).containsExactly(
+                    "Leave Policy.pdf (pages 1, 2, 3)",
+                    "OverTime Policy.pdf (page 1)");
+        }
+
+        @Test
+        void fallsBackToAllRetrievedPagesWhenTheAttributionReplyIsNotJson() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+            attribution = Flux.just("I think S1 is the source.");
+
+            assertThat(done(streamAnswer()).sources()).hasSize(2);
+        }
+
+        /** Retrieval-scoped mode cites every retrieved page and skips the second call. */
+        @Test
+        void retrievalScopedModeCitesEveryRetrievedPageWithoutAttribution() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+
+            List<ChatStreamEvent> events = streamAnswer(ChatService.MODE_RETRIEVAL_SCOPED, STREAM_TIMEOUT);
+
+            assertThat(done(events).sources()).containsExactly(
+                    "Leave Policy.pdf (pages 1, 2, 3)",
+                    "OverTime Policy.pdf (page 1)");
+            verify(requestSpec, times(1)).stream();
+        }
+
+        /** A refusal cites nothing, and there is nothing to attribute. */
+        @Test
+        void aRefusalCitesNothingAndSkipsAttribution() {
+            modelStreams("I could not find this information", " in the HR policies provided.",
+                    " Please contact the HR department directly.");
+
+            assertThat(done(streamAnswer()).sources()).isEmpty();
+            verify(requestSpec, times(1)).stream();
+        }
+
+        @Test
+        void anAnswerThatMerelyEndsInARefusalKeepsItsCitations() {
+            modelStreams("You get 13 planned leaves. " + PromptBuilder.REFUSAL_SENTENCE);
+            attributionReports("S1");
+
+            assertThat(done(streamAnswer()).sources())
+                    .containsExactly("Leave Policy.pdf (page 1)");
+        }
+
+        /**
+         * The HTTP status has already been sent once streaming starts, so a failure part
+         * way through must arrive as a terminal event after the text already delivered.
+         */
+        @Test
+        void aFailureDuringGenerationEndsTheStreamWithAnError() {
+            answer = Flux.concat(
+                    Flux.just("You get 13"),
+                    Flux.error(new IllegalStateException("connection to Ollama reset")));
+
+            List<ChatStreamEvent> events = streamAnswer();
+
+            assertThat(events).hasSize(3);
+            assertThat(events.get(1)).isEqualTo(new ChatStreamEvent.Token("You get 13"));
+            ChatStreamEvent.Error error = (ChatStreamEvent.Error) events.getLast();
+            // The reference matches the retrieval event, and internal detail stays in the log.
+            assertThat(error.requestId())
+                    .isEqualTo(((ChatStreamEvent.Retrieval) events.getFirst()).requestId());
+            assertThat(error.message())
+                    .contains(error.requestId())
+                    .doesNotContain("Ollama reset");
+            verify(requestSpec, times(1)).stream();
+        }
+
+        @Test
+        void anEmptyAnswerEndsTheStreamWithAnError() {
+            modelStreams("", "  ");
+
+            List<ChatStreamEvent> events = streamAnswer();
+
+            assertThat(events.getLast()).isInstanceOf(ChatStreamEvent.Error.class);
+        }
+
+        /** A stalled model must still end the stream with a terminal event. */
+        @Test
+        void aStreamThatOverrunsTheDeadlineEndsWithAnError() {
+            answer = Flux.concat(Flux.just("You get"), Flux.never());
+
+            List<ChatStreamEvent> events =
+                    streamAnswer(ChatService.MODE_MODEL_ATTRIBUTED, Duration.ofMillis(300));
+
+            assertThat(events).hasSize(3);
+            assertThat(events.get(1)).isEqualTo(new ChatStreamEvent.Token("You get"));
+            assertThat(events.getLast()).isInstanceOf(ChatStreamEvent.Error.class);
+        }
+
+        /** The deadline covers attribution too, not only generation. */
+        @Test
+        void theDeadlineAlsoCoversAttribution() {
+            modelStreams("You get 13 planned leaves each calendar year.");
+            attribution = Flux.never();
+
+            List<ChatStreamEvent> events =
+                    streamAnswer(ChatService.MODE_MODEL_ATTRIBUTED, Duration.ofMillis(300));
+
+            assertThat(events.getLast()).isInstanceOf(ChatStreamEvent.Error.class);
+        }
+
+        /** Retrieval runs before the stream exists, so its failure is an ordinary exception. */
+        @Test
+        void aRetrievalFailureIsThrownBeforeStreamingStarts() {
+            when(retrievalService.retrieveDocuments(anyString(), any()))
+                    .thenThrow(new IllegalStateException("database unavailable"));
+
+            assertThatThrownBy(() -> service(ChatService.MODE_MODEL_ATTRIBUTED)
+                    .streamChat(new ChatRequest("Anything?", null)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("database unavailable");
         }
     }
 

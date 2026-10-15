@@ -70,6 +70,18 @@
             <artifactId>spring-ai-starter-model-ollama</artifactId>
         </dependency>
 
+        <!--
+        HTTP client behind the streaming chat call to Ollama. Without it, WebClient falls
+        back to the JDK client, which does not close the connection when a stream is
+        cancelled — so Ollama keeps generating an answer nobody is reading after the
+        browser disconnects. Client only: the server stays Tomcat. Version managed by
+        Spring Boot. spring.http.client.factory keeps blocking calls on the JDK client.
+        -->
+        <dependency>
+            <groupId>io.projectreactor.netty</groupId>
+            <artifactId>reactor-netty-http</artifactId>
+        </dependency>
+
         <!-- VectorStore backed by PostgreSQL + pgvector -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

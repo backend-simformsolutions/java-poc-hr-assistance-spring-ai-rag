@@ -26,6 +26,22 @@ spring:
       max-file-size: 52MB
       max-request-size: 55MB
 
+  # Backstop for a streamed answer (POST /api/chat/stream). Without it the servlet
+  # container's default applies — 30 seconds on Tomcat — and a long answer from a local
+  # model is cut off mid-sentence. Kept longer than app.streaming.timeout, which ends an
+  # overrunning stream with an error event; this one drops the connection with none.
+  # Does not affect POST /api/chat.
+  mvc:
+    async:
+      request-timeout: 3m
+
+  # HTTP client for blocking calls to Ollama (POST /api/chat, embeddings). Pinned to the
+  # JDK client so that adding reactor-netty-http — needed for streaming — does not
+  # change which client those calls use.
+  http:
+    client:
+      factory: jdk
+
   # Runs schema.sql on startup to create the pgvector and uuid-ossp extensions.
   sql:
     init:
@@ -94,7 +110,17 @@ app:
     # model-attributed degrades to retrieval-scoped automatically when the structured
     # reply cannot be parsed or no reported label survives validation, so switching
     # modes changes precision, never correctness.
+    #
+    # POST /api/chat/stream follows the same setting, but cannot stream structured
+    # output as text: it streams a plain answer, then under model-attributed asks which
+    # sources it came from in a second structured call, verified the same way.
     mode: model-attributed
+
+  streaming:
+    # The longest a streamed answer may take, from the first event to done — generation
+    # and attribution together. An overrun ends the stream with an error event. Keep it
+    # below spring.mvc.async.request-timeout.
+    timeout: 150s
 
   chunking:
     # Target characters per chunk. 500-1500 suits prose; this value holds a single

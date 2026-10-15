@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "hr-policy-rag-collection",
     "name": "HR Policy RAG Assistant",
-    "description": "Complete API collection for the Spring Boot HR Policy RAG backend.\n\nAll 9 endpoints are generated from the actual controllers:\n- ChatController      -> POST /api/chat\n- DocumentController  -> POST /api/documents/upload, DELETE /api/documents/all\n- DebugController     -> GET /api/debug/search, /api/debug/search-raw, /api/debug/stats\n- Actuator            -> GET /actuator/health, /actuator/info, /actuator/metrics\n\n## Before you run\n1. Ollama must be listening on 11434 with `llama3` and `nomic-embed-text` pulled.\n2. Postgres+pgvector must be up: `docker-compose up -d` (host port 5433).\n3. Start the app: `mvn spring-boot:run`\n\n## Suggested order\nRun folder 0 (health) -> folder 1 (upload) -> folder 2 (verify retrieval) -> folder 3 (full RAG).\nIf documents are already ingested you can skip folder 1 entirely.\n\n## Note on timing\nRequests in folder 3 take 5-30s. The first call is slowest because Ollama must load llama3 (4.7 GB) into memory.",
+    "description": "Complete API collection for the Spring Boot HR Policy RAG backend.\n\nAll 10 endpoints are generated from the actual controllers:\n- ChatController      -> POST /api/chat, POST /api/chat/stream\n- DocumentController  -> POST /api/documents/upload, DELETE /api/documents/all\n- DebugController     -> GET /api/debug/search, /api/debug/search-raw, /api/debug/stats\n- Actuator            -> GET /actuator/health, /actuator/info, /actuator/metrics\n\n## Before you run\n1. Ollama must be listening on 11434 with `llama3` and `nomic-embed-text` pulled.\n2. Postgres+pgvector must be up: `docker-compose up -d` (host port 5433).\n3. Start the app: `mvn spring-boot:run`\n\n## Suggested order\nRun folder 0 (health) -> folder 1 (upload) -> folder 2 (verify retrieval) -> folder 3 (full RAG).\nIf documents are already ingested you can skip folder 1 entirely.\n\n## Note on timing\nRequests in folder 3 take 5-30s. The first call is slowest because Ollama must load llama3 (4.7 GB) into memory.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -410,6 +410,53 @@
                 "exec": [
                   "pm.test('status 400', () => pm.response.to.have.status(400));",
                   "console.log('Error body:', pm.response.text());"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.5 Ask Question (streaming)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": { "raw": { "language": "json" } },
+              "raw": "{\n  \"question\": \"{{sampleQuestion}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/chat/stream",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "chat", "stream"]
+            },
+            "description": "POST /api/chat/stream\n\nSame body and validation as 3.1, but the answer arrives token by token as Server-Sent Events. Postman shows each event live in the response pane as it arrives.\n\nEvents (every data payload is JSON):\n- retrieval: requestId, question, chunksRetrieved, retrievedChunks — sent before generation starts\n- token: { text } — the next piece of the answer\n- done: sources, processingTimeMs\n- error: requestId, message — generation failed part way; the text so far is incomplete\n\nSources are decided after the answer. Under app.citations.mode=model-attributed, once the last token is sent a second structured model call reports which retrieved sources the answer came from, and each is verified against those supplied; expect done a few seconds after the last token. Under retrieval-scoped, every retrieved page is cited without that call. Nothing verified -> sources lists every retrieved page. A refusal -> sources is empty.\n\nA stream running past app.streaming.timeout (150s) ends with an error event."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('content type is text/event-stream', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream'));",
+                  "const body = pm.response.text();",
+                  "pm.test('starts with retrieval', () => pm.expect(body.trimStart().startsWith('event:retrieval')).to.be.true);",
+                  "pm.test('streamed at least one token', () => pm.expect(body).to.include('event:token'));",
+                  "pm.test('ends with done, not error', () => {",
+                  "    pm.expect(body).to.include('event:done');",
+                  "    pm.expect(body).to.not.include('event:error');",
+                  "});",
+                  "const answer = body.split('\\n')",
+                  "    .filter((line, i, lines) => line.startsWith('data:') && lines[i - 1] === 'event:token')",
+                  "    .map(line => JSON.parse(line.slice(5)).text)",
+                  "    .join('');",
+                  "const doneLine = body.split('\\n').find((line, i, lines) => line.startsWith('data:') && lines[i - 1] === 'event:done');",
+                  "console.log('ANSWER:', answer);",
+                  "if (doneLine) console.log('DONE:', JSON.parse(doneLine.slice(5)));"
                 ]
               }
             }

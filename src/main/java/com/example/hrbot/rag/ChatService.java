@@ -2,8 +2,10 @@ package com.example.hrbot.rag;
 
 import com.example.hrbot.dto.ChatRequest;
 import com.example.hrbot.dto.ChatResponse;
+import com.example.hrbot.dto.ChatStreamEvent;
 import com.example.hrbot.dto.CitedAnswer;
 import com.example.hrbot.dto.RetrievedChunk;
+import com.example.hrbot.dto.SourceAttribution;
 import com.example.hrbot.prompts.PromptBuilder;
 import com.example.hrbot.prompts.PromptBuilder.GroundedPrompt;
 import lombok.extern.slf4j.Slf4j;
@@ -12,7 +14,11 @@ import org.springframework.ai.converter.BeanOutputConverter;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +26,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
@@ -56,16 +64,25 @@ public class ChatService {
     private static final String CITED_ANSWER_SCHEMA =
             new BeanOutputConverter<>(CitedAnswer.class).getFormat();
 
+    /**
+     * Parses the streaming endpoint's attribution reply, and supplies the schema
+     * instruction appended to that prompt.
+     */
+    private static final BeanOutputConverter<SourceAttribution> ATTRIBUTION_CONVERTER =
+            new BeanOutputConverter<>(SourceAttribution.class);
+
     private final RetrievalService retrievalService;
     private final PromptBuilder promptBuilder;
     private final ChatClient chatClient;
     private final String citationMode;
+    private final Duration streamTimeout;
 
     public ChatService(
             RetrievalService retrievalService,
             PromptBuilder promptBuilder,
             ChatClient chatClient,
-            @Value("${app.citations.mode:" + MODE_MODEL_ATTRIBUTED + "}") String citationMode) {
+            @Value("${app.citations.mode:" + MODE_MODEL_ATTRIBUTED + "}") String citationMode,
+            @Value("${app.streaming.timeout:150s}") Duration streamTimeout) {
 
         if (!MODE_MODEL_ATTRIBUTED.equals(citationMode)
                 && !MODE_RETRIEVAL_SCOPED.equals(citationMode)) {
@@ -78,6 +95,7 @@ public class ChatService {
         this.promptBuilder = promptBuilder;
         this.chatClient = chatClient;
         this.citationMode = citationMode;
+        this.streamTimeout = streamTimeout;
 
         log.info("ChatService initialised with citation mode '{}'", citationMode);
     }
@@ -135,6 +153,187 @@ public class ChatService {
 
     /** An answer plus the citations that will be shown with it. */
     private record GeneratedAnswer(String answer, List<String> sources) {}
+
+    /**
+     * Executes the pipeline for a question and streams the answer as it is generated.
+     *
+     * <p>Retrieval runs before this method returns, so a failure there — the database or
+     * the embedding model being unavailable — surfaces as an ordinary exception and an
+     * HTTP error status. Once the stream has started the status has been sent, so a
+     * failure during generation becomes a terminal {@link ChatStreamEvent.Error} instead.
+     *
+     * <p>The answer is generated from the plain prompt and streamed as it arrives;
+     * structured output cannot be streamed as readable text. Citations follow
+     * {@code app.citations.mode}: under {@link #MODE_MODEL_ATTRIBUTED}, a second call asks
+     * which labelled sources the completed answer was taken from and every reported label
+     * is verified, falling back to every retrieved page when none survives; under
+     * {@link #MODE_RETRIEVAL_SCOPED}, every retrieved page is cited without that call.
+     * A refusal cites nothing in either mode.
+     *
+     * <p>Both model calls are non-blocking, so a client disconnect cancels whichever is
+     * running and closes its connection to the model.
+     *
+     * @param request the question and any optional overrides
+     * @return retrieval, then tokens, then exactly one of done or error
+     */
+    public Flux<ChatStreamEvent> streamChat(ChatRequest request) {
+        long startTime = System.currentTimeMillis();
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
+        String question = request.question();
+        Integer topK = request.requestedTopK();
+
+        log.info("[{}] Streaming RAG pipeline started: question='{}', topK={}",
+                requestId, question, topK == null ? "default" : topK);
+
+        List<Document> retrievedDocs = retrievalService.retrieveDocuments(question, topK);
+        List<RetrievedChunk> chunks = toRetrievedChunks(retrievedDocs);
+        log.info("[{}] {} chunks retrieved", requestId, chunks.size());
+
+        GroundedPrompt prompt = promptBuilder.buildPrompt(retrievedDocs, question);
+
+        // Deferred so that the accumulated answer belongs to one subscription.
+        Flux<ChatStreamEvent> generation = Flux.defer(() -> {
+            StringBuilder answer = new StringBuilder();
+
+            Flux<ChatStreamEvent> tokens = chatClient.prompt()
+                    .system(prompt.system())
+                    .user(prompt.user())
+                    .stream()
+                    .content()
+                    .filter(text -> !text.isEmpty())
+                    .doOnNext(text -> {
+                        if (answer.isEmpty()) {
+                            log.info("[{}] First token after {}ms",
+                                    requestId, System.currentTimeMillis() - startTime);
+                        }
+                        answer.append(text);
+                    })
+                    .map(ChatStreamEvent.Token::new);
+
+            // Deferred until the last token has arrived and the whole answer is known.
+            Mono<ChatStreamEvent> done = Mono.defer(() -> completeStream(
+                    requestId, answer.toString(), retrievedDocs, chunks, startTime));
+
+            return tokens.concatWith(done);
+        });
+
+        Instant deadline = Instant.now().plus(streamTimeout);
+
+        return Flux.concat(
+                        Flux.just(new ChatStreamEvent.Retrieval(
+                                requestId, question, chunks.size(), chunks)),
+                        generation)
+                // One deadline for the whole stream, enforced here so that an overrun ends
+                // with an error event. The servlet container's async timeout would instead
+                // drop the connection with no terminal event, so it is set longer.
+                .timeout(Mono.delay(streamTimeout), event -> Mono.delay(timeLeft(deadline)))
+                .onErrorResume(e -> {
+                    if (e instanceof TimeoutException) {
+                        log.error("[{}] Streaming answer exceeded the {} limit",
+                                requestId, streamTimeout);
+                    } else {
+                        log.error("[{}] Streaming answer failed after {}ms: {}",
+                                requestId, System.currentTimeMillis() - startTime, e.getMessage(), e);
+                    }
+                    return Flux.just(new ChatStreamEvent.Error(requestId,
+                            "The answer could not be completed. Quote reference " + requestId
+                                    + " when reporting this; the application log holds the detail."));
+                })
+                .doOnCancel(() -> log.info("[{}] Client disconnected after {}ms; generation cancelled",
+                        requestId, System.currentTimeMillis() - startTime));
+    }
+
+    /** Time remaining until the deadline, or zero once it has passed. */
+    private static Duration timeLeft(Instant deadline) {
+        Duration left = Duration.between(Instant.now(), deadline);
+        return left.isNegative() ? Duration.ZERO : left;
+    }
+
+    /**
+     * Decides the citations for a completed streamed answer.
+     *
+     * <p>Signals {@link IllegalStateException} if the model produced no text, which the
+     * stream reports as an error event.
+     */
+    private Mono<ChatStreamEvent> completeStream(String requestId,
+                                                 String rawAnswer,
+                                                 List<Document> documents,
+                                                 List<RetrievedChunk> chunks,
+                                                 long startTime) {
+        String answer = rawAnswer.trim();
+        if (answer.isEmpty()) {
+            return Mono.error(emptyResponse());
+        }
+
+        if (isRefusal(answer)) {
+            log.info("[{}] Stream completed in {}ms: refusal, cited nothing",
+                    requestId, System.currentTimeMillis() - startTime);
+            return Mono.just(new ChatStreamEvent.Done(List.of(), System.currentTimeMillis() - startTime));
+        }
+
+        if (!modelAttributed()) {
+            log.info("[{}] Stream completed in {}ms: {} character answer, citing every retrieved page",
+                    requestId, System.currentTimeMillis() - startTime, answer.length());
+            return Mono.just(new ChatStreamEvent.Done(buildCitations(chunks), System.currentTimeMillis() - startTime));
+        }
+
+        return attribute(requestId, answer, documents, chunks).map(attributed -> {
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            if (attributed.isEmpty()) {
+                // The answer has already been shown. Citing every page that was searched is
+                // less precise but still accurate.
+                log.info("[{}] Stream completed in {}ms: {} character answer, no verified sources",
+                        requestId, processingTime, answer.length());
+                return new ChatStreamEvent.Done(buildCitations(chunks), processingTime);
+            }
+
+            log.info("[{}] Stream completed in {}ms: {} character answer, {} of {} sources cited",
+                    requestId, processingTime, answer.length(), attributed.size(), chunks.size());
+            return new ChatStreamEvent.Done(buildCitations(attributed), processingTime);
+        });
+    }
+
+    /**
+     * Asks the model which labelled sources a completed answer was taken from, and keeps
+     * only the labels that were supplied.
+     *
+     * <p>The reply is streamed and assembled rather than requested with a blocking call,
+     * so that a client disconnect during attribution closes the connection to the model
+     * as it does during generation.
+     *
+     * <p>Emits an empty list rather than an error when the reply cannot be obtained or
+     * parsed: the answer has already reached the client, so the caller falls back to
+     * citing every retrieved page instead of discarding it.
+     */
+    private Mono<List<RetrievedChunk>> attribute(String requestId,
+                                                 String answer,
+                                                 List<Document> documents,
+                                                 List<RetrievedChunk> chunks) {
+        long attributionStart = System.currentTimeMillis();
+        GroundedPrompt prompt = promptBuilder.buildAttributionPrompt(documents, answer);
+
+        return chatClient.prompt()
+                .system(prompt.system())
+                .user(prompt.user() + System.lineSeparator() + ATTRIBUTION_CONVERTER.getFormat())
+                .stream()
+                .content()
+                .collect(Collectors.joining())
+                .map(reply -> {
+                    SourceAttribution attribution = ATTRIBUTION_CONVERTER.convert(reply);
+                    List<String> labels = attribution == null ? List.of() : attribution.citations();
+                    List<RetrievedChunk> resolved = resolveCitedChunks(labels, chunks);
+                    log.info("[{}] Attribution took {}ms: model reported {}, {} verified",
+                            requestId, System.currentTimeMillis() - attributionStart,
+                            labels, resolved.size());
+                    return resolved;
+                })
+                .onErrorResume(e -> {
+                    log.warn("[{}] Could not attribute the answer ({}); citing every retrieved page",
+                            requestId, e.getMessage());
+                    return Mono.just(List.of());
+                });
+    }
 
     /**
      * The prompt {@link #chat} would send for these documents and this question, both
@@ -343,10 +542,7 @@ public class ChatService {
         // content() is null when the response carries no generation, e.g. if the model
         // returned only tool calls or the request was truncated.
         if (answer == null || answer.isBlank()) {
-            throw new IllegalStateException(
-                    "The language model returned an empty response. "
-                            + "Check that the configured model is available and that the prompt "
-                            + "fits within its context window.");
+            throw emptyResponse();
         }
 
         String trimmed = answer.trim();
@@ -358,6 +554,14 @@ public class ChatService {
 
         log.info("Step 3 complete: {} character answer", trimmed.length());
         return new GeneratedAnswer(trimmed, buildCitations(chunks));
+    }
+
+    /** The failure raised when the model generates no text, on either endpoint. */
+    private static IllegalStateException emptyResponse() {
+        return new IllegalStateException(
+                "The language model returned an empty response. "
+                        + "Check that the configured model is available and that the prompt "
+                        + "fits within its context window.");
     }
 
     /** Converts Spring AI documents into the response DTO, preserving retrieval order. */

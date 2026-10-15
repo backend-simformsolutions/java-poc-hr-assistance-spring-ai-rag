@@ -122,6 +122,51 @@ class PromptBuilderTest {
     }
 
     @Nested
+    @DisplayName("attribution prompt used for streaming")
+    class Attribution {
+
+        private final List<Document> documents = List.of(
+                document("13 planned leaves per year.", "Leave Policy.pdf"),
+                document("Overtime is paid at 1.5x.", "OverTime Policy.pdf"));
+
+        /** The labels the model sees are the ones the caller validates against. */
+        @Test
+        void labelsSourcesExactlyAsTheCitedPromptDoes() {
+            String attribution = promptBuilder.buildAttributionPrompt(documents, "An answer.").user();
+            String cited = promptBuilder.buildCitedPrompt(documents, "A question?").user();
+
+            String sources = cited.substring(0, cited.indexOf("--------------- END OF SOURCES"));
+            assertThat(attribution).startsWith(sources);
+            assertThat(attribution).contains("[S1] from Leave Policy.pdf", "[S2] from OverTime Policy.pdf");
+        }
+
+        @Test
+        void placesTheAnswerAfterTheSourcesAndRulesInTheSystemMessage() {
+            GroundedPrompt prompt = promptBuilder.buildAttributionPrompt(
+                    documents, "You get 13 planned leaves per year.");
+
+            assertThat(prompt.system())
+                    .isEqualTo(promptBuilder.getAttributionSystemPrompt())
+                    .contains("RULES:")
+                    .contains("Do NOT invent labels")
+                    .doesNotContain("13 planned leaves");
+            assertThat(prompt.user().stripTrailing())
+                    .endsWith("You get 13 planned leaves per year.");
+            assertThat(prompt.user().indexOf("END OF SOURCES"))
+                    .isLessThan(prompt.user().indexOf("You get 13 planned leaves per year."));
+        }
+
+        /** It reports labels only; it is not asked to answer or rewrite anything. */
+        @Test
+        void asksForCitationsOnly() {
+            assertThat(promptBuilder.getAttributionSystemPrompt())
+                    .contains("\"citations\"")
+                    .doesNotContain("\"answer\"")
+                    .doesNotContain(PromptBuilder.REFUSAL_SENTENCE);
+        }
+    }
+
+    @Nested
     @DisplayName("differences that distinguish the two modes")
     class ContractDifferences {
 

@@ -113,6 +113,40 @@ public class PromptBuilder {
             """.replace("{refusal}", REFUSAL_SENTENCE);
 
     /**
+     * System message for the attribution step of the streaming endpoint: given labelled
+     * sources and an answer already written from them, report which sources it used.
+     *
+     * <p>The streamed answer is generated from {@link #SYSTEM_PROMPT} alone, and its
+     * sources are decided afterwards by this separate call. Asking a small model to tag
+     * its sentences while answering hurts answer quality — in testing it truncated answers
+     * and added unsupported remarks — so the two jobs are kept apart.
+     */
+    private static final String ATTRIBUTION_SYSTEM_PROMPT = """
+            You identify which numbered sources an answer was taken from.
+
+            RULES:
+            1. The user message contains numbered sources, followed by an answer that was
+               written from them.
+            2. In "citations", list the labels of ONLY the sources whose text states the facts
+               in the answer, for example ["S2"] or ["S1","S3"].
+            3. Use only labels that appear in the user message. Do NOT invent labels.
+            4. If no source states the facts in the answer, return an empty list.
+            """;
+
+    /**
+     * Labelled sources followed by the answer to attribute. No trailer: the caller
+     * appends the structured-output schema instruction to the end.
+     */
+    private static final String ATTRIBUTION_USER_TEMPLATE = """
+            --------------- SOURCES ---------------
+            %s
+            --------------- END OF SOURCES ---------------
+
+            Answer to attribute:
+            %s
+            """;
+
+    /**
      * No "Answer:" trailer here: the structured-output converter appends the expected
      * JSON schema to the end of the user message.
      */
@@ -167,6 +201,28 @@ public class PromptBuilder {
 
         log.debug("Built cited prompt: {} character system message, {} character user message "
                         + "from {} labelled sources",
+                prompt.system().length(), prompt.user().length(), documents.size());
+        return prompt;
+    }
+
+    /**
+     * Builds the prompt that asks which sources a completed answer was taken from, for
+     * use with {@link com.example.hrbot.dto.SourceAttribution}.
+     *
+     * <p>Sources are labelled exactly as in {@link #buildCitedPrompt}, so the labels the
+     * model reports can be validated with the same lookup.
+     *
+     * @param documents retrieved documents, in relevance order
+     * @param answer    the answer that was generated from them
+     * @return the system and user messages to send
+     */
+    public GroundedPrompt buildAttributionPrompt(List<Document> documents, String answer) {
+        GroundedPrompt prompt = new GroundedPrompt(
+                ATTRIBUTION_SYSTEM_PROMPT,
+                ATTRIBUTION_USER_TEMPLATE.formatted(formatLabelledSources(documents), answer));
+
+        log.debug("Built attribution prompt: {} character system message, {} character user "
+                        + "message from {} labelled sources",
                 prompt.system().length(), prompt.user().length(), documents.size());
         return prompt;
     }
@@ -241,6 +297,11 @@ public class PromptBuilder {
     /** The labelled-source system message, for diagnostic endpoints. */
     public String getCitedSystemPrompt() {
         return CITED_SYSTEM_PROMPT;
+    }
+
+    /** The attribution system message used by the streaming endpoint. */
+    public String getAttributionSystemPrompt() {
+        return ATTRIBUTION_SYSTEM_PROMPT;
     }
 
     /** The plain user template, without context, for diagnostic endpoints. */
