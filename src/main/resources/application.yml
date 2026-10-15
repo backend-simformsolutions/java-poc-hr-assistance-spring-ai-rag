@@ -1,0 +1,172 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: hr-policy-rag
+
+  datasource:
+    # Port 5433 is the pgvector container defined in docker-compose.yml. A local
+    # PostgreSQL on the default 5432 will not work unless pgvector is installed there.
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5433}/${DB_NAME:hrbot}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 20000
+
+  # Upload limits. These gate the request before it reaches the application, so they sit
+  # just above the 50MB the ingestion service accepts — a file at that limit is then
+  # rejected by the service's own check, with a specific message, rather than by the
+  # container. max-request-size covers the whole multipart body, not just the file.
+  servlet:
+    multipart:
+      max-file-size: 52MB
+      max-request-size: 55MB
+
+  # Backstop for a streamed answer (POST /api/chat/stream). Without it the servlet
+  # container's default applies — 30 seconds on Tomcat — and a long answer from a local
+  # model is cut off mid-sentence. Kept longer than app.streaming.timeout, which ends an
+  # overrunning stream with an error event; this one drops the connection with none.
+  # Does not affect POST /api/chat.
+  mvc:
+    async:
+      request-timeout: 3m
+
+  # HTTP client for blocking calls to Ollama (POST /api/chat, embeddings). Pinned to the
+  # JDK client so that adding reactor-netty-http — needed for streaming — does not
+  # change which client those calls use.
+  http:
+    client:
+      factory: jdk
+
+  # Runs schema.sql on startup to create the pgvector and uuid-ossp extensions.
+  sql:
+    init:
+      mode: always
+      continue-on-error: true
+
+  ai:
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+
+      chat:
+        options:
+          model: llama3
+          # Deterministic decoding: policy answers should be factual and repeatable.
+          temperature: 0
+          # Fixes the sampler's seed, so identical prompts yield identical answers.
+          seed: 42
+          # Context window: the token budget shared by the prompt and the generated
+          # answer. Set explicitly, because Ollama applies its own default rather than
+          # the model's maximum.
+          #
+          # A prompt that together with num-predict exceeds this budget is truncated
+          # rather than rejected, and what survives is not guaranteed. Keep default-top-k
+          # low enough that the retrieved context and the question fit comfortably.
+          #
+          # 8192 is llama3's maximum. Larger windows cost KV-cache memory and slow
+          # prompt evaluation.
+          num-ctx: 8192
+          # Maximum tokens in the answer, carved out of num-ctx above rather than
+          # added to it.
+          num-predict: 1024
+
+      embedding:
+        options:
+          # Produces 768-dimensional vectors; must match the dimensions below.
+          # Documents and queries have to be embedded by the same model, or their
+          # vectors are not comparable.
+          model: nomic-embed-text
+
+    vectorstore:
+      pgvector:
+        # Creates the vector_store table and its index on startup if absent.
+        initialize-schema: true
+        # Must match the embedding model's output width.
+        dimensions: 768
+        # Cosine distance compares direction rather than magnitude, so scores are
+        # unaffected by chunk length.
+        distance-type: COSINE_DISTANCE
+        # IVFFLAT builds faster; HNSW gives better recall at higher build cost.
+        index-type: IVFFLAT
+        schema-validation: false
+
+app:
+  citations:
+    # How the pages shown to the user are decided.
+    #
+    #   model-attributed  Sources are labelled in the prompt, the model reports which
+    #                     labels it used, and every reported label is verified against
+    #                     the set that was supplied. Precise, but depends on the model
+    #                     following a structured-output contract.
+    #
+    #   retrieval-scoped  Cite every page that was retrieved. Always truthful and never
+    #                     fails, but imprecise: pages that did not contribute to the
+    #                     answer are cited alongside those that did.
+    #
+    # model-attributed degrades to retrieval-scoped automatically when the structured
+    # reply cannot be parsed or no reported label survives validation, so switching
+    # modes changes precision, never correctness.
+    #
+    # POST /api/chat/stream follows the same setting, but cannot stream structured
+    # output as text: it streams a plain answer, then under model-attributed asks which
+    # sources it came from in a second structured call, verified the same way.
+    mode: model-attributed
+
+  streaming:
+    # The longest a streamed answer may take, from the first event to done — generation
+    # and attribution together. An overrun ends the stream with an error event. Keep it
+    # below spring.mvc.async.request-timeout.
+    timeout: 150s
+
+  chunking:
+    # Target characters per chunk. 500-1500 suits prose; this value holds a single
+    # policy section without spanning several unrelated topics.
+    #
+    # Chunk size is a precision/coverage trade-off applied to every document:
+    #   smaller -> sharper embeddings and better precision, but a fact spanning a
+    #              boundary can be split across two chunks
+    #   larger  -> related text stays together, but each embedding averages more
+    #              topics and matches any single question less sharply
+    chunk-size: 1000
+    # Characters shared between consecutive chunks, so a fact spanning a boundary
+    # survives intact in at least one of them.
+    #
+    # Overlap duplicates text across chunks, so it stays small — 5-20% of chunk-size,
+    # and towards the lower end when boundaries already fall on sentence or paragraph
+    # breaks.
+    chunk-overlap: 50
+
+  retrieval:
+    # How many chunks to place in the prompt when a request does not specify.
+    #
+    # More context is not automatically better: every extra chunk enlarges the prompt,
+    # slows inference, and adds text the model has to keep straight. Few high-scoring
+    # chunks generally outperform many weak ones.
+    default-top-k: 5
+    # Permissive by design: cosine scores for policy prose cluster low, and a chunk that
+    # answers the question often scores well under 0.5. default-top-k does the real
+    # limiting; this only discards near-orthogonal matches.
+    similarity-threshold: 0.1
+
+logging:
+  level:
+    root: INFO
+    # Pipeline stages, retrieval scores and prompt sizes.
+    com.example.hrbot: DEBUG
+    # Requests and responses exchanged with Ollama.
+    org.springframework.ai: DEBUG
+    # SQL issued against pgvector.
+    org.springframework.jdbc: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always

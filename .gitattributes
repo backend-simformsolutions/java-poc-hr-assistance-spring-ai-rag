@@ -1,0 +1,20 @@
+# Normalise line endings so the repository stores LF regardless of the platform a
+# contributor commits from, and check out the platform-native form.
+* text=auto
+
+# Explicit rules for the file types this project uses, plus common additions.
+*.java   text diff=java
+*.xml    text
+*.yml    text
+*.sql    text
+*.md     text
+*.json   text
+*.sh     text eol=lf
+*.bat    text eol=crlf
+*.ps1    text eol=crlf
+
+# Binary; never normalise or diff.
+*.pdf    binary
+*.jar    binary
+*.png    binary
+*.jpg    binary

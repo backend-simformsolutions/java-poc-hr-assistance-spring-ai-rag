@@ -1,0 +1,42 @@
+# PostgreSQL with pgvector, for local development.
+#
+# Only the database runs in Docker; the Spring Boot application runs on the host and
+# connects over JDBC. The official pgvector image is used because the extension needs
+# native compilation per PostgreSQL version and is often absent from a local install.
+#
+# Published on 5433 to avoid colliding with a PostgreSQL already using 5432.
+#
+#   Start:  docker compose up -d
+#   Stop:   docker compose down
+#   Logs:   docker compose logs -f postgres
+#   Shell:  docker exec -it hrbot-postgres psql -U postgres -d hrbot
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: hrbot-postgres
+
+    # host:container
+    ports:
+      - "5433:5432"
+
+    environment:
+      POSTGRES_DB: hrbot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    # Named volume, so stored vectors survive a container restart.
+    volumes:
+      - hrbot-pgdata:/var/lib/postgresql/data
+
+    # "Started" and "accepting connections" are not the same moment; this reports the
+    # latter, so `docker compose ps` — or `up --wait` — can be trusted before first use.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hrbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hrbot-pgdata:
+    driver: local
