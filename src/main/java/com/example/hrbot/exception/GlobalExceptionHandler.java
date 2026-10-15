@@ -7,6 +7,7 @@ import jakarta.validation.Path;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.util.DisconnectedClientHelper;
 
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -27,6 +29,11 @@ import java.util.stream.Collectors;
  * <p>Request-binding and validation failures are handled explicitly and answered with
  * 400; the remaining handlers cover ingestion, upstream availability, and anything
  * unanticipated. The most specific {@code @ExceptionHandler} for a type wins.
+ *
+ * <p>Every body is sent with an explicit JSON content type. Without one, Spring would
+ * negotiate the type against the request's {@code Accept} header, and a client of the
+ * streaming endpoint that accepts only {@code text/event-stream} would receive the right
+ * status with an empty body.
  */
 @Slf4j
 @RestControllerAdvice
@@ -44,7 +51,7 @@ public class GlobalExceptionHandler {
 
         log.warn("Validation failed for {}: {}", request.getRequestURI(), message);
 
-        return ResponseEntity.badRequest().body(new ErrorResponse(
+        return ResponseEntity.badRequest().contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 HttpStatus.BAD_REQUEST.value(),
                 "Validation Failed",
                 message,
@@ -108,7 +115,7 @@ public class GlobalExceptionHandler {
 
         log.error("Document processing failed: {}", ex.getMessage(), ex);
 
-        return ResponseEntity.unprocessableEntity().body(new ErrorResponse(
+        return ResponseEntity.unprocessableEntity().contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 HttpStatus.UNPROCESSABLE_ENTITY.value(),
                 "Document Processing Error",
                 ex.getMessage(),
@@ -124,7 +131,7 @@ public class GlobalExceptionHandler {
 
         log.warn("File upload too large: {}", ex.getMessage());
 
-        return ResponseEntity.badRequest().body(new ErrorResponse(
+        return ResponseEntity.badRequest().contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 HttpStatus.BAD_REQUEST.value(),
                 "File Too Large",
                 "The uploaded file exceeds the maximum allowed size.",
@@ -143,7 +150,7 @@ public class GlobalExceptionHandler {
 
         log.error("Failed to connect to Ollama: {}", ex.getMessage());
 
-        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(new ErrorResponse(
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 HttpStatus.SERVICE_UNAVAILABLE.value(),
                 "AI Service Unavailable",
                 "Cannot connect to Ollama. Ensure Ollama is running at http://localhost:11434 "
@@ -164,6 +171,15 @@ public class GlobalExceptionHandler {
             Exception ex,
             HttpServletRequest request) {
 
+        // The client went away mid-response — typically a streamed answer abandoned by
+        // closing the tab. Not a fault, and there is no one left to send a body to.
+        // Checked first so that no other branch tries to write to the closed connection;
+        // returning null tells Spring the exception is handled and nothing is written.
+        if (DisconnectedClientHelper.isClientDisconnectedException(ex)) {
+            log.info("Client disconnected from {}: {}", request.getRequestURI(), ex.getMessage());
+            return null;
+        }
+
         // Spring's own request-handling exceptions already carry the status the request
         // deserves — an unsupported method, an unacceptable media type, an unmapped
         // path. Honour it, so a caller's mistake is not reported as a server fault.
@@ -180,7 +196,7 @@ public class GlobalExceptionHandler {
         log.error("Unexpected error [{}] at {}: {}",
                 reference, request.getRequestURI(), ex.getMessage(), ex);
 
-        return ResponseEntity.internalServerError().body(new ErrorResponse(
+        return ResponseEntity.internalServerError().contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 HttpStatus.INTERNAL_SERVER_ERROR.value(),
                 "Internal Server Error",
                 "An unexpected error occurred. Quote reference " + reference
@@ -205,7 +221,7 @@ public class GlobalExceptionHandler {
 
         log.warn("{} {} for {}: {}", status.value(), error, request.getRequestURI(), message);
 
-        return ResponseEntity.status(status).body(new ErrorResponse(
+        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(new ErrorResponse(
                 status.value(),
                 error,
                 message,
